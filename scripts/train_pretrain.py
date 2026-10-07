@@ -15,23 +15,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from glm53_flash import ByteTokenizer, GLM53FlashFromScratch, ModelConfig
+from glm53_flash.corpus import CORPORA, RealTextCorpus, SyntheticCorpus, ensure_corpus
 from glm53_flash.runtime import save_checkpoint
-from glm53_flash.tasks import pretraining_text
-
-
-def batch_for(tokenizer: ByteTokenizer, *, step: int, batch_size: int, sequence_length: int, seed: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, int]:
-    rows = []
-    for offset in range(batch_size):
-        text = pretraining_text(step * batch_size + offset, seed=seed)
-        ids = tokenizer.encode(text, bos=True, eos=True)
-        if len(ids) > sequence_length + 1:
-            raise ValueError(f"training example exceeds sequence length: {len(ids)}")
-        ids += [tokenizer.pad_id] * (sequence_length + 1 - len(ids))
-        rows.append(ids)
-    values = torch.tensor(rows, dtype=torch.long, device=device)
-    inputs, labels = values[:, :-1], values[:, 1:]
-    labels = labels.masked_fill(labels == tokenizer.pad_id, -100)
-    return inputs, labels, int((labels != -100).sum().item())
 
 
 def main() -> int:
@@ -45,6 +30,12 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dim", type=int, default=192)
     parser.add_argument("--layers", type=int, default=12)
+    parser.add_argument("--dataset", choices=("synthetic", *CORPORA), default="synthetic",
+                        help="synthetic generated corpus (default) or a real text corpus")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"),
+                        help="download cache for real corpora")
+    parser.add_argument("--val-batches", type=int, default=4)
+    parser.add_argument("--val-every", type=int, default=10)
     parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     args = parser.parse_args()
     if args.output.exists():
@@ -65,6 +56,33 @@ def main() -> int:
     device = torch.device(device_name)
     tokenizer = ByteTokenizer()
     config = ModelConfig(dim=args.dim, layers=args.layers, max_sequence_length=max(192, args.sequence_length))
+    if args.dataset == "synthetic":
+        corpus = SyntheticCorpus(seed=args.seed, tokenizer=tokenizer)
+    else:
+        receipt_info = ensure_corpus(args.dataset, args.data_dir)
+        corpus = RealTextCorpus(
+            [Path(path) for path in receipt_info["paths"]],
+            name=args.dataset, tokenizer=tokenizer,
+        )
+    corpus_description = corpus.describe()
+    print(json.dumps({"dataset": corpus_description}, sort_keys=True), flush=True)
+
+    def validation_loss() -> float:
+        model.eval()
+        losses = []
+        with torch.no_grad():
+            for batch_index in range(args.val_batches):
+                inputs, labels, _ = corpus.validation_batch(
+                    batch_index, batch_size=args.batch_size,
+                    sequence_length=args.sequence_length, device=device,
+                )
+                logits, _ = model(inputs)
+                losses.append(float(F.cross_entropy(
+                    logits.reshape(-1, config.vocab_size), labels.reshape(-1), ignore_index=-100,
+                )))
+        model.train()
+        return sum(losses) / len(losses)
+
     model = GLM53FlashFromScratch(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0.1)
     counts = model.parameter_counts()
@@ -79,9 +97,9 @@ def main() -> int:
         torch.cuda.reset_peak_memory_stats()
     for step in range(1, args.steps + 1):
         step_started = time.perf_counter()
-        inputs, labels, tokens = batch_for(
-            tokenizer, step=step - 1, batch_size=args.batch_size,
-            sequence_length=args.sequence_length, seed=args.seed, device=device,
+        inputs, labels, tokens = corpus.training_batch(
+            step - 1, batch_size=args.batch_size,
+            sequence_length=args.sequence_length, device=device,
         )
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
@@ -108,6 +126,8 @@ def main() -> int:
             "tokens_seen": tokens_seen,
             "seconds": round(time.perf_counter() - step_started, 4),
         }
+        if step == 1 or step % args.val_every == 0 or step == args.steps:
+            row["val_loss"] = round(validation_loss(), 6)
         rows.append(row)
         if step == 1 or step % 10 == 0:
             print(json.dumps(row, sort_keys=True), flush=True)
@@ -123,6 +143,7 @@ def main() -> int:
         "schema_version": "1.0",
         "status": "complete",
         "stage": "coding_pretraining",
+        "dataset": corpus_description,
         "config": config.to_dict(),
         "parameter_counts": counts,
         "seed": args.seed,

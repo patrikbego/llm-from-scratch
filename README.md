@@ -90,6 +90,36 @@ python experiments/analyze_pretraining_curriculum_order.py --help
 
 Final raw results, charts, and reports are under [`artifacts/experiments`](artifacts/experiments).
 
+## Train on real text instead of synthetic data
+
+The default pretraining corpus is generated in code. To see what changes when the model reads real documents, `scripts/train_pretrain.py` accepts a `--dataset` flag with two real corpora. They are downloaded once, cached under `data/`, and accompanied by a `source.json` receipt recording URLs, licenses, sizes, and SHA-256 hashes:
+
+| `--dataset` | Text source | Bytes | License |
+|---|---|---:|---|
+| `synthetic` (default) | generated Python functions ([`tasks.py`](glm53_flash/tasks.py)) | ~1.1 MB | generated |
+| `shakespeare` | *The Complete Works of William Shakespeare*, Project Gutenberg #100 | 5.4 MB | public domain |
+| `python` | CPython 3.12.7 standard-library modules, pinned release tag | ~0.5 MB | PSF License for Python |
+
+Everything downstream is unchanged: same byte tokenizer, same model, same optimizer — only the text stream differs ([`corpus.py`](glm53_flash/corpus.py)). Real corpora use a chronological 95/5 train/validation split, and training now reports `val_loss` on held-out data for every dataset.
+
+```bash
+python scripts/train_pretrain.py --output runs/shakespeare --dataset shakespeare \
+  --steps 200 --checkpoints 200 --batch-size 32 --sequence-length 128 --seed 42
+
+python scripts/evaluate.py --checkpoint runs/shakespeare/checkpoint-0200 \
+  --split dev --per-family 4 --output runs/shakespeare/eval-dev.json
+```
+
+**Measured comparison** — full 25.7M model, 200 steps, batch 32, sequence length 128, seed 42, Apple Silicon MPS, then greedy evaluation on the 32 coding dev tasks:
+
+| Pretraining data | Val loss (start → end) | Coding dev solved | Sample greedy generation |
+|---|---:|---:|---|
+| `synthetic` generated code | 4.95 → **0.31** | **31/32** | `return x + 1` (correct) |
+| `shakespeare` real text | 4.96 → 2.13 | 0/32 | ` the the the the…` |
+| `python` real code | 4.41 → 1.56 | 0/32 | indentation whitespace |
+
+Every model learned *something* — validation loss fell on each corpus's own held-out slice. But only synthetic pretraining transfers to the coding benchmark, because the benchmark is the same template distribution. CPython source is real Python code and still taught the model nothing usable at this scale and budget: 200 steps over ~0.3 MB of diverse code cannot imprint the templated `# Complete this Python function.` pattern that the evaluator measures. The lesson is the real-LLM lesson in miniature: **capabilities follow the training data**, and benchmark scores say as much about distribution overlap as about learning. (Single seed, short run — a demonstration, not a benchmark.)
+
 ## Follow-up research: which RL choices matter?
 
 The first experiment established that executable feedback can teach narrow coding behaviors. The follow-up asked a different question:
@@ -284,6 +314,7 @@ Every task, prompt, completion, unit-test count, seed, checkpoint hash, timing, 
 - [`glm53_flash/model.py`](glm53_flash/model.py): hybrid attention, MoE, residual streams, and language model.
 - [`glm53_flash/vision.py`](glm53_flash/vision.py): RGB patch embedding, two-block vision tower, 2 x 2 merger, projector, image tokens, and direct-patch baseline.
 - [`glm53_flash/tasks.py`](glm53_flash/tasks.py): synthetic pretraining data and deterministic splits.
+- [`glm53_flash/corpus.py`](glm53_flash/corpus.py): optional real-text corpora (Shakespeare, CPython stdlib) with download receipts and deterministic batching.
 - [`glm53_flash/evaluator.py`](glm53_flash/evaluator.py): fail-closed AST and executable unit-test verifier.
 - [`scripts/train_pretrain.py`](scripts/train_pretrain.py): random initialization and causal language-model pretraining.
 - [`scripts/train_rl.py`](scripts/train_rl.py): batched RLOO with executable reward.

@@ -22,3 +22,4 @@ __pycache__/
 /.uv-cache/
 /.uv-python/
 /.upstream-clone/
+/data/
